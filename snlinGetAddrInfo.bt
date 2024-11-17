@@ -1,0 +1,96 @@
+#!/usr/bin/env bpftrace -S
+/*
+ * Purpose:
+ *   Trace snlinGetAddrInfo and getaddrinfo behavior of the
+ *   Oracle client.
+ * 
+ * Author:
+ *   Christoph Lutz
+ *
+ * Date:
+ *   Apr-14, 2024
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ * Tested on:
+ *   Oracle 19.23, OEL 8.10, kernel 5.4.17-2136.330.7.5, bpftrace 0.16
+ */
+
+/* 
+ * Redefining user-space structs and types because
+ * of dirty problems with user space types in some
+ * versions of bpftrace (longing for BTF...)
+ */
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+
+BEGIN
+{
+    if ($# != 1) {
+        printf("\nUsage: ./snlinGetAddrInfo.bt <pid>\n\n");
+        exit();
+    }
+    printf("Tracing snlinGetAddrInfo behavior (pid %d). Hit ^C to stop.\n", $1);
+}
+
+/*
+ * snlinGetAddrInfo is called from various locations,
+ * known ones are:
+ *   - ntlad_expand_hst: this expands the SCAN hosts
+ *   - nlad_pr
+ *   - nlad_ind
+ *   - nttbnd2addr
+ */
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/lib/libclntsh.so.19.1:snlinGetAddrInfo
+/ pid == $1 /
+{
+    @in_gai[tid] = pid;
+    printf("-> snlinGetAddrInfo\n");
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/lib/libclntsh.so.19.1:snlinGetAddrInfo
+/ @in_gai[tid] /
+{
+    delete(@in_gai[tid]);
+    printf("<- snlinGetAddrInfo: %d\n\n", retval);
+}
+
+uprobe:/usr/lib64/libc.so.6:getaddrinfo
+/ @in_gai[tid] /
+{
+    $ai_flags = (int32) ((struct addrinfo *) arg2)->ai_flags; 
+    $ai_family = (int32) ((struct addrinfo *) arg2)->ai_family;
+
+    printf("  -> getaddrinfo\n"); 
+    printf("       host: %s\n", str(arg0));
+    printf("       hints:\n");
+
+    /* Show ai_flags */
+    printf("         ai_flags=%d\n", $ai_flags);
+    if($ai_flags & AI_PASSIVE    ) { printf("           AI_PASSIVE\n");     }
+    if($ai_flags & AI_CANONNAME  ) { printf("           AI_CANONNAME\n");   }
+    if($ai_flags & AI_NUMERICHOST) { printf("           AI_NUMERICHOST\n"); }
+    if($ai_flags & AI_V4MAPPED   ) { printf("           AI_V4MAPPED\n");    }
+    if($ai_flags & AI_ALL        ) { printf("           AI_ALL\n");         }
+    if($ai_flags & AI_ADDRCONFIG ) { printf("           AI_ADDRCONFIG\n");  }
+    if($ai_flags == 0            ) { printf("           NULL\n");           }
+
+    /* Show ai_family (only most common ones) */
+    printf("         ai_family=%d\n", $ai_family);
+    if($ai_family == AF_UNIX )  { printf("           AF_UNIX\n");   }
+    if($ai_family == AF_INET )  { printf("           AF_INET\n");   }
+    if($ai_family == AF_INET6)  { printf("           AF_INET6\n");  }
+    if($ai_family == 0       )  { printf("           AF_UNSPEC\n"); }
+}
+
+uretprobe:/usr/lib64/libc.so.6:getaddrinfo
+/ @in_gai[tid] /
+{
+    printf("  <- getaddrinfo: %d\n", retval);
+}
+
+END {
+	clear(@in_gai)
+}
